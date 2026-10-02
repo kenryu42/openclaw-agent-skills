@@ -42,6 +42,13 @@ Choose the Git target explicitly when the default is ambiguous:
 PR base or `origin/main`. Clean main has no implicit review target.
 `--mode uncommitted` is an alias for local. The helper does not fetch refs.
 
+Add `--exclude <path>` (repeatable) to leave committed build output or other generated
+trees out of the selected target, for example `--exclude dist`. A Git `:(exclude)`
+pathspec narrows the diff, path list, binary/image checks, and untracked files in every
+mode; the bundle header names what was excluded. Values are plain repository-relative
+paths; pathspec magic, options, absolute paths, and `..` are refused during argument
+parsing. It does not change which target `--mode auto` picks.
+
 Registered nested linked checkouts from the same repository are outside the
 current review scope. Their presence or edits do not make the parent dirty;
 ordinary adjacent files remain included in the review. Worktree boundaries are
