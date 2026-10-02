@@ -55,6 +55,22 @@ SAFE_GIT_CONFIG_ARGS = tuple(
 ) + ("-c", "diff.suppressBlankEmpty=false")
 SAFE_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv", "--no-renames", "--no-color")
 COMMIT_DIFF_FLAGS = (*SAFE_DIFF_FLAGS, "--root", "--no-commit-id", "-r")
+
+
+def exclude_path(value: str) -> str:
+    """`--exclude` value: a plain repository-relative path, no pathspec magic or options."""
+    if (not value or value[0] in ":-/\\" or re.match(r"[A-Za-z]:", value)
+            or ".." in re.split(r"[/\\]", value)):
+        raise argparse.ArgumentTypeError(f"must be a plain repository-relative path, got {value!r}")
+    return value
+
+
+def exclude_pathspec(excludes: Sequence[str]) -> tuple[str, ...]:
+    return ("--", *(f":(exclude){value}" for value in excludes)) if excludes else ()
+
+
+def exclude_note(excludes: Sequence[str]) -> str:
+    return f"\nexcluded pathspecs: {', '.join(excludes)}" if excludes else ""
 DIFF_HUNK_CONTENT_BOUNDARY = "\0autoreview-diff-hunk-boundary\0"
 SENSITIVE_PATH_PARTS = {
     ".aws",
@@ -2880,7 +2896,7 @@ def linked_worktree_boundary(
 
 
 def untracked_sources(
-    repo: Path, claimed_paths: list[str] | tuple[str, ...] = (),
+    repo: Path, claimed_paths: list[str] | tuple[str, ...] = (), excludes: Sequence[str] = (),
 ) -> UntrackedSources:
     files = git_path_list(
         repo,
@@ -2889,6 +2905,7 @@ def untracked_sources(
         "--others",
         "--exclude-standard",
         "-z",
+        *exclude_pathspec(excludes),
     )
     directories = [
         rel for rel in files
@@ -2923,8 +2940,9 @@ def untracked_sources(
 def collect_untracked_file_snapshots(
     repo: Path,
     claimed_paths: list[str] | tuple[str, ...] = (),
+    excludes: Sequence[str] = (),
 ) -> tuple[list[tuple[str, str]], int]:
-    files = untracked_sources(repo, claimed_paths).files
+    files = untracked_sources(repo, claimed_paths, excludes).files
     omitted = 0
     included: list[tuple[str, str]] = []
     for rel in files:
@@ -2953,10 +2971,12 @@ def collect_untracked_file_snapshots(
     return included, omitted
 
 
-def local_status(repo: Path, untracked: list[str], *, redact: bool = False) -> str:
+def local_status(
+    repo: Path, untracked: list[str], *, redact: bool = False, excludes: Sequence[str] = (),
+) -> str:
     if redact:
         return REVIEW_SECURITY_OMISSION
-    status = git(repo, "status", "--short", "--untracked-files=no").rstrip()
+    status = git(repo, "status", "--short", "--untracked-files=no", *exclude_pathspec(excludes)).rstrip()
     lines = [status] if status else []
     lines.extend(f"?? {rel}" for rel in untracked)
     return "\n".join(lines)
@@ -3137,18 +3157,21 @@ def local_diff_capture(repo: Path, *args: str) -> tuple[str, str, str, list[str]
     return patch, "\0".join(records[:index]) + "\0", "\0".join(records[index:]) + "\0", paths
 
 
-def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
+def local_bundle(
+    repo: Path, base_ref: str | None = None, excludes: Sequence[str] = (),
+) -> CapturedBundle:
     if base_ref is not None:
         base_ref = validate_git_ref(repo, base_ref, "base", pin=True)
-    staged_base = ("--end-of-options", base_ref) if base_ref is not None else ()
+    pathspec = exclude_pathspec(excludes)
+    staged_base = (("--end-of-options", base_ref) if base_ref is not None else ()) + pathspec
     staged_patch, staged_raw, staged_numstat, staged_paths = local_diff_capture(repo, "--cached", *staged_base)
-    unstaged_patch, unstaged_raw, unstaged_numstat, unstaged_paths = local_diff_capture(repo)
+    unstaged_patch, unstaged_raw, unstaged_numstat, unstaged_paths = local_diff_capture(repo, *pathspec)
     require_no_binary_diff("local staged diff", staged_numstat, staged_raw)
     require_no_binary_diff("local unstaged diff", unstaged_numstat, unstaged_raw)
     require_no_gitlink_diff("local staged diff", staged_raw)
     require_no_gitlink_diff("local unstaged diff", unstaged_raw)
     untracked_snapshots, omitted_untracked = collect_untracked_file_snapshots(
-        repo, staged_paths + unstaged_paths,
+        repo, staged_paths + unstaged_paths, excludes,
     )
     untracked = [rel for rel, _content in untracked_snapshots]
     omitted_tracked = len(
@@ -3187,8 +3210,9 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
             repo,
             untracked,
             redact=bool(omitted_tracked or omitted_untracked),
+            excludes=excludes,
         ),
-        "# Staged Diff" if base_ref is None else f"# Staged Diff\nbase: {base_ref}",
+        ("# Staged Diff" if base_ref is None else f"# Staged Diff\nbase: {base_ref}") + exclude_note(excludes),
         (
             REVIEW_SECURITY_OMISSION
             if tracked_sensitive_paths(staged_paths)
@@ -3199,7 +3223,7 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
         (
             REVIEW_SECURITY_OMISSION
             if tracked_sensitive_paths(unstaged_paths)
-            else git(repo, "diff", *SAFE_DIFF_FLAGS, "--stat")
+            else git(repo, "diff", *SAFE_DIFF_FLAGS, "--stat", *pathspec)
         ),
         unstaged_patch,
     ]
@@ -3404,8 +3428,9 @@ def source_tree_snapshot(
     return head, index_entries, tuple(sorted(fingerprints))
 
 
-def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
+def branch_bundle(repo: Path, base_ref: str, excludes: Sequence[str] = ()) -> CapturedBundle:
     base_label = base_ref
+    pathspec = exclude_pathspec(excludes)
     base_ref = validate_git_ref(repo, base_ref, "base", pin=True)
     head_ref = validate_git_ref(repo, "HEAD", "commit", pin=True)
     merge_base = git(repo, "merge-base", base_ref, head_ref).strip()
@@ -3416,20 +3441,21 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
         "--name-only",
         "-z",
         "--end-of-options",
-        merge_base, head_ref,
+        merge_base, head_ref, *pathspec,
     )
     branch_numstat = git(
         repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--numstat", "-z",
-        "--end-of-options", merge_base, head_ref,
+        "--end-of-options", merge_base, head_ref, *pathspec,
     )
     branch_raw = git(
         repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--raw", "--no-abbrev", "-z",
-        "--end-of-options", merge_base, head_ref,
+        "--end-of-options", merge_base, head_ref, *pathspec,
     )
     require_no_gitlink_diff("branch diff", branch_raw)
     images = capture_added_branch_images(repo, branch_raw, branch_numstat)
     branch_patch = git(
         repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", "--end-of-options", merge_base, head_ref,
+        *pathspec,
     )
     omitted_tracked = bool(tracked_sensitive_paths(branch_paths))
     branch_patch = validate_review_patch(
@@ -3439,7 +3465,7 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
     return CapturedBundle("\n\n".join(
         [
             "# Branch Diff",
-            f"base: {base_label}",
+            f"base: {base_label}" + exclude_note(excludes),
             (
                 REVIEW_SECURITY_OMISSION
                 if omitted_tracked
@@ -3449,7 +3475,7 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
                     *COMMIT_DIFF_FLAGS,
                     "--stat",
                     "--end-of-options",
-                    merge_base, head_ref,
+                    merge_base, head_ref, *pathspec,
                 )
             ),
             branch_patch,
@@ -3485,14 +3511,15 @@ def commit_diff_refs(repo: Path, commit_ref: str) -> tuple[str, ...]:
     return (*parents, commit_ref)
 
 
-def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
+def commit_bundle(repo: Path, commit_ref: str, excludes: Sequence[str] = ()) -> CapturedBundle:
     refs = commit_diff_refs(repo, commit_ref)
-    commit_patch = git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", *refs)
-    commit_paths = git_path_list(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--name-only", "-z", *refs)
-    commit_raw = git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--raw", "-z", *refs)
+    pathspec = exclude_pathspec(excludes)
+    commit_patch = git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", *refs, *pathspec)
+    commit_paths = git_path_list(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--name-only", "-z", *refs, *pathspec)
+    commit_raw = git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--raw", "-z", *refs, *pathspec)
     require_no_binary_diff(
         "commit diff",
-        git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--numstat", "-z", *refs),
+        git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--numstat", "-z", *refs, *pathspec),
         commit_raw,
     )
     require_no_gitlink_diff("commit diff", commit_raw)
@@ -3501,8 +3528,10 @@ def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
     commit_summary = REVIEW_SECURITY_OMISSION
     if not blocked_paths:
         commit_summary = git(repo, "show", "--no-patch", "--format=fuller", refs[-1])
-        commit_summary += git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--stat", *refs)
-    parent_header = f"parent: {refs[0]}" if len(refs) == 2 else "parent: none (verified raw root)"
+        commit_summary += git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--stat", *refs, *pathspec)
+    parent_header = (
+        f"parent: {refs[0]}" if len(refs) == 2 else "parent: none (verified raw root)"
+    ) + exclude_note(excludes)
     text = "\n\n".join(
         [
             "# Commit Diff",
@@ -3516,13 +3545,15 @@ def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
     return CapturedBundle(text, paths, commit=refs[-1])
 
 
-def build_bundle(repo: Path, target: str, target_ref: str | None, commit_ref: str) -> CapturedBundle:
+def build_bundle(
+    repo: Path, target: str, target_ref: str | None, commit_ref: str, excludes: Sequence[str] = (),
+) -> CapturedBundle:
     if target == "local":
-        return local_bundle(repo, target_ref)
+        return local_bundle(repo, target_ref, excludes)
     if target == "branch":
         assert target_ref
-        return branch_bundle(repo, target_ref)
-    return commit_bundle(repo, commit_ref)
+        return branch_bundle(repo, target_ref, excludes)
+    return commit_bundle(repo, commit_ref, excludes)
 
 
 def relative_evidence_path(repo: Path, raw_path: str, label: str) -> Path:
@@ -7015,6 +7046,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
     parser.add_argument("--base", help="Branch base, or explicit commit to compare with the index in local mode.")
     parser.add_argument("--commit", default="HEAD")
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        type=exclude_path,
+        help="Repository-relative path to leave out of the review target, such as committed build output (dist). Repeatable; plain relative paths only.",
+    )
     parser.add_argument("--engine", choices=ENGINES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
     parser.add_argument(
         "--model",
@@ -7387,7 +7425,7 @@ def dry_run_preflight(
     bundle_ok = True
     try:
         with PreparationProgress("bundle preparation"):
-            captured = build_bundle(repo, target, target_ref, args.commit)
+            captured = build_bundle(repo, target, target_ref, args.commit, getattr(args, "exclude", ()))
             for reviewer in reviewers:
                 require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
@@ -7732,6 +7770,8 @@ def main_with_args(args: argparse.Namespace) -> int:
     display_ref = args.commit if target == "commit" else target_ref
     if display_ref:
         print(f"ref: {display_ref}", flush=True)
+    if getattr(args, "exclude", ()):
+        print(f"excludes: {', '.join(args.exclude)}", flush=True)
     if args.dry_run:
         return dry_run_preflight(args, reviewers, repo, target, target_ref)
 
@@ -7740,7 +7780,7 @@ def main_with_args(args: argparse.Namespace) -> int:
     with PreparationProgress("initial source snapshot") as progress:
         review_source_snapshot = source_tree_snapshot(repo, progress)
     with PreparationProgress("bundle/evidence preparation"):
-        captured = build_bundle(repo, target, target_ref, args.commit)
+        captured = build_bundle(repo, target, target_ref, args.commit, getattr(args, "exclude", ()))
         require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
             target_ref = args.commit
