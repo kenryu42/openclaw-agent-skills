@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Prefer Claude before OpenAI/Codex when choosing an Autoreview engine, including independent second opinions; retain explicit user choices and require a concrete Claude availability failure before switching.
 - Update development Node.js types to 26.6.4 and the native macOS sandbox-test Codex CLI to 0.160.1.
 - Skip inaccessible executable search candidates during Autoreview preflight while preserving explicit executable selection and repository-path rejection. Thanks @vincentkoc.
 - Use one shared autoreview installation across repositories through thin Markdown entrypoints instead of vendored implementations and tests.

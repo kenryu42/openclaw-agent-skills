@@ -1,6 +1,6 @@
 ---
 name: autoreview
-description: "Structured code review when explicitly requested, preferring OpenAI/Codex before Claude."
+description: "Structured code review when explicitly requested, preferring Claude before OpenAI/Codex."
 ---
 
 # Auto Review
@@ -170,10 +170,10 @@ parent-relative patch; otherwise leave the attribution unknown.
 
 ## Engines
 
-For automatic reviewer selection, try OpenAI models through Codex before Claude.
-Start with `--engine codex` even when the invoking agent uses Codex or asks for
-an independent second opinion. Use Claude only when the user explicitly selects
-it or Codex is unavailable for the review; report the concrete availability failure
+For automatic reviewer selection, try Claude before OpenAI models through Codex.
+Start with `--engine claude` even when the invoking agent uses Claude or asks for
+an independent second opinion. Use Codex only when the user explicitly selects
+it or Claude is unavailable for the review; report the concrete availability failure
 before switching. Do not switch because a review is slow, rate-limited, or returns
 findings, or to bypass a safety refusal or isolation failure.
 
